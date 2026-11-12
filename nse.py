@@ -24,7 +24,7 @@ FALLBACK = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "SBIN", "AXISBAN
 def _session():
     s = requests.Session()
     s.headers.update(HDRS)
-    s.get(BASE + "/option-chain", timeout=10)  # sets the cookies NSE expects
+    s.get(BASE + "/option-chain", timeout=8)  # sets the cookies NSE expects
     return s
 
 
@@ -35,7 +35,7 @@ def _legacy(symbol):
 def symbols():
     """Indices first, then F&O stocks (NSE list, or a short fallback list)."""
     try:
-        d = _session().get(BASE + "/api/underlying-information", timeout=10).json()["data"]
+        d = _session().get(BASE + "/api/underlying-information", timeout=8).json()["data"]
         stocks = sorted({x["symbol"] for x in d["UnderlyingList"]})
         if stocks:
             return list(INDEX) + stocks
@@ -47,7 +47,7 @@ def symbols():
 def lot_sizes():
     """{symbol: lot size} from NSE's market-lots file; {} if unavailable."""
     try:
-        t = requests.get("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv", headers=HDRS, timeout=10).text
+        t = requests.get("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv", headers=HDRS, timeout=8).text
         df = pd.read_csv(io.StringIO(t), skipinitialspace=True)
         sym, first = df.iloc[:, 1].astype(str).str.strip(), pd.to_numeric(df.iloc[:, 2], errors="coerce")
         return {s: int(v) for s, v in zip(sym, first) if pd.notna(v)}
@@ -59,7 +59,7 @@ def expiries(symbol):
     s = _session()
     for path in (f"/api/option-chain-contract-info?symbol={quote(symbol)}", _legacy(symbol)):
         try:
-            j = s.get(BASE + path, timeout=10).json()
+            j = s.get(BASE + path, timeout=8).json()
             e = j.get("expiryDates") or j.get("records", {}).get("expiryDates")
             if e:
                 return e
@@ -83,7 +83,7 @@ def chain(symbol, expiry):
     kind = "Indices" if symbol in INDEX else "Equity"
     for path in (f"/api/option-chain-v3?type={kind}&symbol={quote(symbol)}&expiry={expiry}", _legacy(symbol)):
         try:
-            rec = s.get(BASE + path, timeout=10).json()["records"]
+            rec = s.get(BASE + path, timeout=8).json()["records"]
             rows = [{"strike": d["strikePrice"], **_leg(d.get("CE"), "ce"), **_leg(d.get("PE"), "pe")}
                     for d in rec["data"] if (d.get("expiryDate") or d.get("expiryDates") or expiry) == expiry]
             if rows:
@@ -97,3 +97,21 @@ def chain(symbol, expiry):
 def history(symbol):
     df = yf.Ticker(INDEX.get(symbol, symbol + ".NS")).history(period="1y", interval="1d")
     return df[["Open", "High", "Low", "Close"]].dropna()
+
+
+def est_expiries(symbol, n=5):
+    """Estimated expiry dates (Tuesdays), used when NSE is unreachable. Holidays are not adjusted."""
+    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+    out = []
+    if symbol == "NIFTY":  # weekly
+        d = today + pd.Timedelta(days=(1 - today.weekday()) % 7)
+        out = [d + pd.Timedelta(weeks=i) for i in range(n)]
+    else:  # monthly: last Tuesday
+        m = today.replace(day=1)
+        while len(out) < n:
+            last = m + pd.offsets.MonthEnd(0)
+            tue = last - pd.Timedelta(days=(last.weekday() - 1) % 7)
+            if tue >= today:
+                out.append(tue)
+            m = m + pd.offsets.MonthBegin(1)
+    return [d.strftime("%d-%b-%Y") for d in out]
