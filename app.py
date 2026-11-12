@@ -1,10 +1,15 @@
+from math import erf, exp, log, sqrt
+
 import pandas as pd
 import streamlit as st
 
 import nse
 import strategy as sg
 
-TH, SL, RR, MAX_SP, MIN_VOL, MIN_OI = 3, 30, 2.0, 5, 1000, 10000
+TH, SL, RR, MIN_VOL, MIN_OI, FAR = 3, 30, 2.0, 1000, 10000, 0.02  # far OTM = ~2% from spot
+STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
+
+
 def est_expiries(symbol, n=5):
     """Estimated expiry dates (Tuesdays) when NSE is unreachable; holidays are not adjusted."""
     today = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
@@ -23,7 +28,15 @@ def est_expiries(symbol, n=5):
     return [d.strftime("%d-%b-%Y") for d in out]
 
 
-STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
+def bs(s, k, iv, t, call, r=0.065):
+    """Black-Scholes premium estimate (iv as a decimal, t in years)."""
+    if t <= 0 or iv <= 0:
+        return max(s - k, 0) if call else max(k - s, 0)
+    v = iv * sqrt(t)
+    d1 = (log(s / k) + (r + iv * iv / 2) * t) / v
+    N = lambda x: 0.5 * (1 + erf(x / sqrt(2)))
+    return s * N(d1) - k * exp(-r * t) * N(d1 - v) if call else k * exp(-r * t) * N(v - d1) - s * N(-d1)
+
 
 st.set_page_config("Nifty Options", layout="centered")
 st.markdown("<style>.block-container{padding-top:4.5rem}</style>"
@@ -100,40 +113,53 @@ def view():
     if side is None:
         st.warning(f"NO TRADE · score {total:+d}, need ±{TH} or more")
     else:
-        kind = "CALL" if side == "ce" else "PUT"
+        call = side == "ce"
         lv = sorted((v, k) for k, v in piv.items())
         up = [(v, k) for v, k in lv if v > spot]
         dn = [(v, k) for v, k in lv if v < spot][::-1]
-        stop, tgts = (dn[:1], up[:2]) if side == "ce" else (up[:1], dn[:2])
+        stop, tgts = (dn[:1], up[:2]) if call else (up[:1], dn[:2])
         fmt = lambda L: " / ".join(f"{k} {v:,.1f}" for v, k in L) or "n/a"
-        way = "below" if side == "ce" else "above"
-        if ch is None:
-            atm = round(spot / STEP[sym]) * STEP[sym] if sym in STEP else None
-            st.success(f"BUY {kind} · {sym} {int(atm) if atm else 'ATM'} {side.upper()} · {ex}")
-            st.markdown(f"**Entry** spot ≈ {spot:,.1f} · **Exit** close {way} {fmt(stop)} · **Target** {fmt(tgts)}")
-            st.caption("NSE chain is unreachable here, so premium, bid/ask, OI and IV were not checked. "
-                       "Confirm the premium in your broker app.")
-        else:
-            row = sg.pick(ch, spot, side, 0)
-            checks, sp, q = sg.liquidity(row, side, MAX_SP, MIN_VOL, MIN_OI)
-            entry = row[f"{side}_ask"] if q else row[f"{side}_ltp"]
-            if entry <= 0 or not all(checks.values()):
-                st.warning(f"WAIT · {kind} bias ({total:+d}) but {int(row.strike)} {side.upper()} fails: "
-                           + (", ".join(k for k, v in checks.items() if not v) or "no price"))
+        st.success(f"BUY {'CALL' if call else 'PUT'} · {sym} · {ex}")
+        t = max(dte, 0.3) / 365
+        iv0 = atm_iv or (rv * 1.2 if rv == rv else 0.0)  # % ; realised-vol proxy when no chain
+        tspot = tgts[0][0] if tgts else None
+        lot = get_lots().get(sym) or nse.DEFAULT_LOT.get(sym)
+        for name, far in (("ATM", False), ("Far OTM ~2%", True)):
+            goal = spot * ((1 + FAR) if call else (1 - FAR)) if far else spot
+            if ch is not None:
+                row = ch.iloc[(ch.strike - goal).abs().idxmin()]
+                strike = float(row.strike)
+                checks, sp, q = sg.liquidity(row, side, 15 if far else 5, MIN_VOL, MIN_OI)
+                entry = row[f"{side}_ask"] if q else row[f"{side}_ltp"]
+                iv = row[f"{side}_iv"] or atm_iv
+                bad = [n for n, ok in checks.items() if not ok]
+                if entry <= 0 or bad:
+                    st.caption(f"{name} {int(strike)} {side.upper()}: skipped ({', '.join(bad) or 'no price'})")
+                    continue
+            elif sym in STEP:
+                strike = float(round(goal / STEP[sym]) * STEP[sym])
+                iv = iv0
+                entry = bs(spot, strike, iv / 100, t, call) if iv else 0
+                if entry <= 0:
+                    st.caption(f"{name} {int(strike)} {side.upper()}: premium estimate unavailable")
+                    continue
             else:
-                lot = get_lots().get(sym, nse.DEFAULT_LOT.get(sym, 1))
-                slp, tgt = entry * (1 - SL / 100), entry * (1 + SL * RR / 100)
-                st.success(f"BUY {kind} · {sym} {int(row.strike)} {side.upper()} · {ex}")
-                st.markdown(f"**Entry** ₹{entry:.2f} ({'ask' if q else 'LTP'}) · **Exit (SL)** ₹{slp:.2f} · **Target** ₹{tgt:.2f}")
-                st.markdown(f"**Spot exit:** close {way} {fmt(stop)} · **Spot target:** {fmt(tgts)}")
-                st.caption(f"Cost/lot ₹{entry * lot:,.0f} · Max loss ≈ ₹{(entry - slp) * lot:,.0f} · Spread {sp:.1f}% · "
-                           f"Vol {row[side + '_vol']:,.0f} · OI {row[side + '_oi']:,.0f} · IV {row[side + '_iv']}%")
-                notes = [n for n in (
-                    not q and "bid/ask unavailable (market closed?), LTP used",
-                    rv and atm_iv > 1.5 * rv and f"IV {atm_iv:.0f}% rich vs realised {rv:.0f}%",
-                ) if n]
-                if notes:
-                    st.caption("⚠ " + " · ".join(notes))
+                st.caption(f"{name}: strike not available here, pick it in your broker chain")
+                continue
+            tgt = bs(tspot, strike, iv / 100, max(t - 1 / 365, 0.1 / 365), call) if tspot and iv else 0
+            if tgt <= entry:
+                tgt = entry * (1 + SL * RR / 100)
+            slp = entry * (1 - (50 if far else SL) / 100)
+            pre = "~" if ch is None else ""
+            cost = f" · Cost/lot ₹{entry * lot:,.0f}" if lot else ""
+            st.markdown(f"**{name} · {int(strike)} {side.upper()}** — Entry {pre}₹{entry:.2f} · "
+                        f"Exit {pre}₹{slp:.2f} · Target ~₹{tgt:.2f}{cost}")
+        st.markdown(f"**Spot exit:** close {'below' if call else 'above'} {fmt(stop)} · **Spot target:** {fmt(tgts)}")
+        st.caption("~ = model estimate (target is the premium if spot reaches the first spot target"
+                   + ("; entry/exit too, as NSE chain is unreachable here, so confirm in your broker app" if ch is None else "")
+                   + "). Far OTM is a low-probability trade: the whole premium can go to zero.")
+        if ch is not None and rv and atm_iv > 1.5 * rv:
+            st.caption(f"⚠ IV {atm_iv:.0f}% is rich vs realised {rv:.0f}%: IV-crush risk for buyers.")
         if dte <= 1:
             st.caption("⚠ Expiry within a day: heavy theta decay, keep size tiny.")
     st.caption(f"{ts or 'Price data: Yahoo'} · Rule-based, not backtested, not advice.")
