@@ -5,6 +5,24 @@ import nse
 import strategy as sg
 
 TH, SL, RR, MAX_SP, MIN_VOL, MIN_OI = 3, 30, 2.0, 5, 1000, 10000
+def est_expiries(symbol, n=5):
+    """Estimated expiry dates (Tuesdays) when NSE is unreachable; holidays are not adjusted."""
+    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+    out = []
+    if symbol == "NIFTY":  # weekly
+        d = today + pd.Timedelta(days=(1 - today.weekday()) % 7)
+        out = [d + pd.Timedelta(weeks=i) for i in range(n)]
+    else:  # monthly: last Tuesday
+        m = today.replace(day=1)
+        while len(out) < n:
+            last = m + pd.offsets.MonthEnd(0)
+            tue = last - pd.Timedelta(days=(last.weekday() - 1) % 7)
+            if tue >= today:
+                out.append(tue)
+            m = m + pd.offsets.MonthBegin(1)
+    return [d.strftime("%d-%b-%Y") for d in out]
+
+
 STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
 
 st.set_page_config("Nifty Options", layout="centered")
@@ -40,7 +58,7 @@ def get_chain(s, e):
 a, b = st.columns(2)
 sym = a.selectbox("Symbol (type to search)", get_syms())
 exps = get_exp(sym)
-ex = b.selectbox("Expiry" if exps else "Expiry (estimated)", exps or nse.est_expiries(sym))
+ex = b.selectbox("Expiry" if exps else "Expiry (estimated)", exps or est_expiries(sym))
 c, d = st.columns([2, 1])
 go = c.button("🔍 Search", type="primary", use_container_width=True)
 auto = d.toggle("Auto-run")
