@@ -1,4 +1,7 @@
 """NSE option chain + Yahoo Finance price history (no Streamlit dependency)."""
+import io
+from urllib.parse import quote
+
 import pandas as pd
 import requests
 import yfinance as yf
@@ -10,7 +13,12 @@ HDRS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": BASE + "/option-chain",
 }
-TICKERS = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
+INDEX = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
+DEFAULT_LOT = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60}  # verify on NSE
+FALLBACK = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "SBIN", "AXISBANK", "KOTAKBANK", "LT", "ITC",
+            "BHARTIARTL", "TATASTEEL", "MARUTI", "SUNPHARMA", "BAJFINANCE", "HINDUNILVR", "ADANIENT",
+            "ADANIPORTS", "WIPRO", "HCLTECH", "ONGC", "NTPC", "POWERGRID", "COALINDIA", "M&M", "TITAN",
+            "ASIANPAINT", "ULTRACEMCO", "JSWSTEEL", "SBILIFE"]
 
 
 def _session():
@@ -20,9 +28,36 @@ def _session():
     return s
 
 
+def _legacy(symbol):
+    return f"/api/option-chain-{'indices' if symbol in INDEX else 'equities'}?symbol={quote(symbol)}"
+
+
+def symbols():
+    """Indices first, then F&O stocks (NSE list, or a short fallback list)."""
+    try:
+        d = _session().get(BASE + "/api/underlying-information", timeout=10).json()["data"]
+        stocks = sorted({x["symbol"] for x in d["UnderlyingList"]})
+        if stocks:
+            return list(INDEX) + stocks
+    except Exception:
+        pass
+    return list(INDEX) + sorted(FALLBACK)
+
+
+def lot_sizes():
+    """{symbol: lot size} from NSE's market-lots file; {} if unavailable."""
+    try:
+        t = requests.get("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv", headers=HDRS, timeout=10).text
+        df = pd.read_csv(io.StringIO(t), skipinitialspace=True)
+        sym, first = df.iloc[:, 1].astype(str).str.strip(), pd.to_numeric(df.iloc[:, 2], errors="coerce")
+        return {s: int(v) for s, v in zip(sym, first) if pd.notna(v)}
+    except Exception:
+        return {}
+
+
 def expiries(symbol):
     s = _session()
-    for path in (f"/api/option-chain-contract-info?symbol={symbol}", f"/api/option-chain-indices?symbol={symbol}"):
+    for path in (f"/api/option-chain-contract-info?symbol={quote(symbol)}", _legacy(symbol)):
         try:
             j = s.get(BASE + path, timeout=10).json()
             e = j.get("expiryDates") or j.get("records", {}).get("expiryDates")
@@ -45,8 +80,8 @@ def _leg(x, p):
 def chain(symbol, expiry):
     """Returns (spot, DataFrame sorted by strike, NSE timestamp)."""
     s = _session()
-    for path in (f"/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={expiry}",
-                 f"/api/option-chain-indices?symbol={symbol}"):
+    kind = "Indices" if symbol in INDEX else "Equity"
+    for path in (f"/api/option-chain-v3?type={kind}&symbol={quote(symbol)}&expiry={expiry}", _legacy(symbol)):
         try:
             rec = s.get(BASE + path, timeout=10).json()["records"]
             rows = [{"strike": d["strikePrice"], **_leg(d.get("CE"), "ce"), **_leg(d.get("PE"), "pe")}
@@ -60,5 +95,5 @@ def chain(symbol, expiry):
 
 
 def history(symbol):
-    df = yf.Ticker(TICKERS[symbol]).history(period="1y", interval="1d")
+    df = yf.Ticker(INDEX.get(symbol, symbol + ".NS")).history(period="1y", interval="1d")
     return df[["Open", "High", "Low", "Close"]].dropna()
