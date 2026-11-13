@@ -11,6 +11,11 @@ import requests
 API = "https://api.upstox.com"
 INSTRUMENTS = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 IST = timezone(timedelta(hours=5, minutes=30))
+_T = {}
+
+
+def login(token):
+    _T["t"] = token
 
 
 def universe():
@@ -33,18 +38,18 @@ def universe():
     return out
 
 
-def _get(path, token):
-    r = requests.get(API + path, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=15)
+def _get(path):
+    r = requests.get(API + path, headers={"Authorization": f"Bearer {_T['t']}", "Accept": "application/json"}, timeout=15)
     if r.status_code == 401:
         raise PermissionError("Upstox token invalid or expired")
     r.raise_for_status()
     return r.json()["data"]
 
 
-def chain(key, expiry, token):
+def chain(info, expiry):
     """Live option chain: (spot, DataFrame sorted by strike). IV in %, chg = OI - previous OI."""
     rows, spot = [], None
-    for d in _get(f"/v2/option/chain?instrument_key={quote(key, safe='')}&expiry_date={expiry}", token):
+    for d in _get(f"/v2/option/chain?instrument_key={quote(info['key'], safe='')}&expiry_date={expiry}"):
         spot = d.get("underlying_spot_price") or spot
         r = {"strike": float(d["strike_price"])}
         for p, leg in (("ce", d.get("call_options")), ("pe", d.get("put_options"))):
@@ -59,10 +64,20 @@ def chain(key, expiry, token):
     return float(spot), pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
 
 
-def history(key, token, days=420):
-    """Daily candles (oldest first) for the last ~14 months."""
-    today = datetime.now(IST).date()
-    d = _get(f"/v3/historical-candle/{quote(key, safe='')}/days/1/{today}/{today - timedelta(days=days)}", token)
+def _candles(d):
     df = pd.DataFrame(d["candles"], columns=["t", "Open", "High", "Low", "Close", "Vol", "OI"])
     df.index = pd.DatetimeIndex(pd.to_datetime(df.pop("t")))
     return df.sort_index()[["Open", "High", "Low", "Close"]].astype(float)
+
+
+def minutes(info, interval=5, days=8):
+    """N-minute candles for the last few sessions, including today's live candles (oldest first)."""
+    today, k = datetime.now(IST).date(), quote(info["key"], safe="")
+    old = _candles(_get(f"/v3/historical-candle/{k}/minutes/{interval}/{today}/{today - timedelta(days=days)}"))
+    new = _candles(_get(f"/v3/historical-candle/intraday/{k}/minutes/{interval}"))
+    df = pd.concat([old, new])
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def enrich(info, expiry, ch, side, strikes):
+    return ch  # Upstox's chain already carries bid/ask

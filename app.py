@@ -1,168 +1,180 @@
-from math import erf, exp, log, sqrt
+import os
+from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-import nse
 import strategy as sg
 
-TH, SL, RR, MIN_VOL, MIN_OI, FAR = 3, 30, 2.0, 1000, 10000, 0.02  # far OTM = ~2% from spot
-STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50}
-
-
-def est_expiries(symbol, n=5):
-    """Estimated expiry dates (Tuesdays) when NSE is unreachable; holidays are not adjusted."""
-    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
-    out = []
-    if symbol == "NIFTY":  # weekly
-        d = today + pd.Timedelta(days=(1 - today.weekday()) % 7)
-        out = [d + pd.Timedelta(weeks=i) for i in range(n)]
-    else:  # monthly: last Tuesday
-        m = today.replace(day=1)
-        while len(out) < n:
-            last = m + pd.offsets.MonthEnd(0)
-            tue = last - pd.Timedelta(days=(last.weekday() - 1) % 7)
-            if tue >= today:
-                out.append(tue)
-            m = m + pd.offsets.MonthBegin(1)
-    return [d.strftime("%d-%b-%Y") for d in out]
-
-
-def bs(s, k, iv, t, call, r=0.065):
-    """Black-Scholes premium estimate (iv as a decimal, t in years)."""
-    if t <= 0 or iv <= 0:
-        return max(s - k, 0) if call else max(k - s, 0)
-    v = iv * sqrt(t)
-    d1 = (log(s / k) + (r + iv * iv / 2) * t) / v
-    N = lambda x: 0.5 * (1 + erf(x / sqrt(2)))
-    return s * N(d1) - k * exp(-r * t) * N(d1 - v) if call else k * exp(-r * t) * N(v - d1) - s * N(-d1)
-
+TH, LO, HI, LOTS = 4, 3.0, 5.0, 2  # signal threshold, premium band in Rs, lots (article: 2-3 at most)
+MIN_VOL, MIN_OI, MAX_SP = 1000, 10000, 15
+IST = timezone(timedelta(hours=5, minutes=30))
+ORDER = {"NIFTY": 0, "BANKNIFTY": 1, "FINNIFTY": 2}
+dfmt = lambda e: datetime.strptime(e, "%Y-%m-%d").strftime("%d-%b-%Y")
+pct = lambda p: "<0.1%" if p < 0.001 else f"{p:.1%}"
 
 st.set_page_config("Nifty Options", layout="centered")
 st.markdown("<style>.block-container{padding-top:4.5rem}</style>"
-            "<div style='font-size:13px;font-weight:600;letter-spacing:1px;opacity:.7'>NIFTY OPTIONS</div>",
+            "<div style='font-size:13px;font-weight:600;letter-spacing:1px;opacity:.7'>NIFTY OPTIONS · EXPIRY ZERO-TO-HERO</div>",
             unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3600)
-def get_syms(): return nse.symbols()
-@st.cache_data(ttl=3600)
-def get_lots(): return nse.lot_sizes()
-@st.cache_data(ttl=300)
-def get_hist(s): return nse.history(s)
-
-
-@st.cache_data(ttl=120)
-def get_exp(s):
+def secret(name):
     try:
-        return nse.expiries(s)
+        return str(st.secrets[name])
     except Exception:
-        return []
+        return os.environ.get(name, "")
 
 
+if secret("UPSTOX_TOKEN"):
+    import upstox as prov
+    prov.login(secret("UPSTOX_TOKEN"))
+    SRC = "Upstox"
+elif secret("GROWW_API_KEY") and (secret("GROWW_TOTP_SECRET") or secret("GROWW_API_SECRET")):
+    import growwdata as prov
+    prov.login(secret("GROWW_API_KEY"), secret("GROWW_TOTP_SECRET"), secret("GROWW_API_SECRET"))
+    SRC = "Groww"
+else:
+    st.error("Live data ke liye broker API chahiye. Streamlit → Manage app → Settings → Secrets mein Groww ke ye do daalo:")
+    st.code('GROWW_API_KEY = "..."\nGROWW_TOTP_SECRET = "..."')
+    st.stop()
+
+
+def hint(e):
+    t = str(e).lower()
+    if "403" in t or "forbidden" in t:
+        return "Access nahi mila: Groww Live Data subscription active hai? (Groww app → Settings → Trading APIs)"
+    if "401" in t or "unauthor" in t or "expired" in t or "invalid" in t:
+        return "Credentials ya token galat/expire. Secrets check karo."
+    return str(e)
+
+
+@st.cache_data(ttl=43200, show_spinner="Instrument list load ho rahi hai (pehli baar 30-60 sec lag sakte hain)...")
+def get_uni(): return prov.universe()
 @st.cache_data(ttl=20)
-def get_chain(s, e):
-    try:
-        return nse.chain(s, e)
-    except Exception:
-        return None
+def get_m(sym): return prov.minutes(uni[sym])
+@st.cache_data(ttl=10)
+def get_chain(sym, exp): return prov.chain(uni[sym], exp)
 
 
+try:
+    uni = get_uni()
+except Exception as e:
+    st.error(f"Instrument list nahi mili: {hint(e)}")
+    st.stop()
+
+syms = sorted(uni, key=lambda s: (uni[s]["type"] != "INDEX", ORDER.get(s, 3), s))
+now0 = datetime.now(IST)
+today = now0.strftime("%Y-%m-%d")
 a, b = st.columns(2)
-sym = a.selectbox("Symbol (type to search)", get_syms())
-exps = get_exp(sym)
-ex = b.selectbox("Expiry" if exps else "Expiry (estimated)", exps or est_expiries(sym))
+sym = a.selectbox("Symbol (type to search)", syms)
+exps = [e for e in uni[sym]["exp"] if e >= today]
+ex = b.selectbox("Expiry", exps, format_func=dfmt)
 c, d = st.columns([2, 1])
 go = c.button("🔍 Search", type="primary", use_container_width=True)
 auto = d.toggle("Auto-run")
+if not ex:
+    st.warning("Is symbol ke liye koi expiry nahi mili.")
+    st.stop()
+if ex != today and not st.query_params.get("test"):  # add ?test=1 to the URL to check live data on a non-expiry day
+    st.info(f"Aaj {sym} ki expiry nahi hai. Next expiry {dfmt(ex)} "
+            f"({(datetime.strptime(ex, '%Y-%m-%d').date() - now0.date()).days} din baad). "
+            "Ye app sirf expiry-day Zero-to-Hero ke liye hai.")
+    tod = [s for s in syms if today in uni[s]["exp"]]
+    if tod:
+        st.caption("Aaj expiry wale symbols: " + ", ".join(tod[:15]))
+    st.stop()
 if go:
     st.session_state.run = True
 if not (st.session_state.get("run") or auto):
-    st.caption("Symbol aur expiry chuno, phir Search dabao.")
+    st.caption("Aaj expiry hai. Search dabao.")
     st.stop()
 
 
 @st.fragment(run_every=30 if auto else None)
 def view():
-    try:
-        h = get_hist(sym)
-        assert len(h) > 60
-    except Exception:
-        st.error("Price history nahi mili (Yahoo). Thodi der baad Search dabao.")
+    now = datetime.now(IST)
+    t0, t1 = (now.replace(hour=h_, minute=m_, second=0, microsecond=0) for h_, m_ in ((9, 15), (15, 30)))
+    if now < t0:
+        st.info("Market 9:15 par khulega. Tab Search dabao.")
         return
-    got = get_chain(sym, ex)
-    spot, ch, ts = got if got else (float(h["Close"].iloc[-1]), None, "")
-    done = h[h.index.date < pd.Timestamp.now(tz="Asia/Kolkata").date()]
-    piv = sg.pivots(done.iloc[-1])
-    sc, rv = sg.price_scores(h)
-    pcr = atm_iv = 0.0
-    if ch is not None:
-        cs, pcr, atm_iv, _ = sg.chain_scores(ch, spot)
-        sc.update(cs)
+    if now > t1:
+        st.info("Aaj ki expiry khatam ho chuki hai (3:30 PM).")
+        return
+    info = uni[sym]
+    try:
+        m = get_m(sym)
+        spot, ch = get_chain(sym, ex)
+    except Exception as e:
+        st.error(f"Live data nahi aaya: {hint(e)}")
+        return
+    if len(m) < 60 or m.index[-1] < now - timedelta(minutes=20) and now - t0 > timedelta(minutes=20):
+        st.error(f"Intraday candles fresh nahi hain (last candle {m.index[-1]:%d-%b %H:%M}). Purane data par trade nahi dikhaunga.")
+        return
+    day = np.array(m.index.date)
+    prev, td = m[day < now.date()], m[day == now.date()]
+    if prev.empty:
+        st.error("Pichle session ka data nahi mila, signal nikalna mumkin nahi.")
+        return
+    last = prev[np.array(prev.index.date) == prev.index.date[-1]]
+    piv = sg.pivots({"High": last.High.max(), "Low": last.Low.min(), "Close": last.Close.iloc[-1]})
+    sc, _ = sg.price_scores(m)
+    cs, pcr, atm_iv, _ = sg.chain_scores(ch, spot)
+    sc.update(cs)
+    chg = spot / td.Open.iloc[0] - 1 if len(td) else 0.0
+    sc["Day"] = (1 if chg > 0.0015 else -1 if chg < -0.0015 else 0, f"{chg:+.2%} from open")
+    mp = sg.max_pain(ch)
+    dmp = (mp - spot) / spot
+    sc["MaxPain"] = (1 if dmp > 0.002 else -1 if dmp < -0.002 else 0, f"Max pain {mp:,.0f}")
     total = sum(v[0] for v in sc.values())
+    mx = 10 if ch[["ce_chg", "pe_chg"]].to_numpy().any() else 9  # OI build-up needs previous OI (Groww's chain has none)
     side = "ce" if total >= TH else "pe" if total <= -TH else None
-    dte = (pd.to_datetime(ex, format="%d-%b-%Y") - pd.Timestamp.now().normalize()).days
 
+    left = t1 - now
+    st.caption(f"🟢 LIVE · {SRC} · {now:%H:%M:%S} IST · expiry close mein {left.seconds // 3600}h {left.seconds % 3600 // 60}m")
     mood = "🟢 BULLISH" if side == "ce" else "🔴 BEARISH" if side == "pe" else "🟡 SIDEWAYS"
-    st.markdown(f"**{sym} {spot:,.1f}** · {mood} ({total:+d}) · Trend {sc['Trend'][0]:+d} · "
-                f"Structure {sc['Structure'][0]:+d} · Momentum {sc['Momentum'][0]:+d}"
-                + (f" · PCR {pcr:.2f}" if ch is not None else ""))
+    st.markdown(f"**{sym} {spot:,.1f}** · {mood} ({total:+d}/{mx}) · Trend {sc['Trend'][0]:+d} · "
+                f"Structure {sc['Structure'][0]:+d} · Momentum {sc['Momentum'][0]:+d} · PCR {pcr:.2f} · Max pain {mp:,.0f}")
     st.markdown(" · ".join(f"R{i} {piv[f'R{i}']:,.1f}" for i in (1, 2, 3)) + "  |  "
                 + " · ".join(f"S{i} {piv[f'S{i}']:,.1f}" for i in (1, 2, 3)))
 
     if side is None:
-        st.warning(f"NO TRADE · score {total:+d}, need ±{TH} or more")
+        st.warning(f"NO TRADE · score {total:+d}, need ±{TH} or more. Zero-to-Hero mein direction pakki chahiye.")
     else:
-        call = side == "ce"
-        lv = sorted((v, k) for k, v in piv.items())
-        up = [(v, k) for v, k in lv if v > spot]
-        dn = [(v, k) for v, k in lv if v < spot][::-1]
-        stop, tgts = (dn[:1], up[:2]) if call else (up[:1], dn[:2])
-        fmt = lambda L: " / ".join(f"{k} {v:,.1f}" for v, k in L) or "n/a"
-        st.success(f"BUY {'CALL' if call else 'PUT'} · {sym} · {ex}")
-        t = max(dte, 0.3) / 365
-        iv0 = atm_iv or (rv * 1.2 if rv == rv else 0.0)  # % ; realised-vol proxy when no chain
-        tspot = tgts[0][0] if tgts else None
-        lot = get_lots().get(sym) or nse.DEFAULT_LOT.get(sym)
-        for name, far in (("ATM", False), ("Far OTM ~2%", True)):
-            goal = spot * ((1 + FAR) if call else (1 - FAR)) if far else spot
-            if ch is not None:
-                row = ch.iloc[(ch.strike - goal).abs().idxmin()]
-                strike = float(row.strike)
-                checks, sp, q = sg.liquidity(row, side, 15 if far else 5, MIN_VOL, MIN_OI)
-                entry = row[f"{side}_ask"] if q else row[f"{side}_ltp"]
-                iv = row[f"{side}_iv"] or atm_iv
-                bad = [n for n, ok in checks.items() if not ok]
-                if entry <= 0 or bad:
-                    st.caption(f"{name} {int(strike)} {side.upper()}: skipped ({', '.join(bad) or 'no price'})")
-                    continue
-            elif sym in STEP:
-                strike = float(round(goal / STEP[sym]) * STEP[sym])
-                iv = iv0
-                entry = bs(spot, strike, iv / 100, t, call) if iv else 0
-                if entry <= 0:
-                    st.caption(f"{name} {int(strike)} {side.upper()}: premium estimate unavailable")
-                    continue
-            else:
-                st.caption(f"{name}: strike not available here, pick it in your broker chain")
-                continue
-            tgt = bs(tspot, strike, iv / 100, max(t - 1 / 365, 0.1 / 365), call) if tspot and iv else 0
-            if tgt <= entry:
-                tgt = entry * (1 + SL * RR / 100)
-            slp = entry * (1 - (50 if far else SL) / 100)
-            pre = "~" if ch is None else ""
-            cost = f" · Cost/lot ₹{entry * lot:,.0f}" if lot else ""
-            st.markdown(f"**{name} · {int(strike)} {side.upper()}** — Entry {pre}₹{entry:.2f} · "
-                        f"Exit {pre}₹{slp:.2f} · Target ~₹{tgt:.2f}{cost}")
-        st.markdown(f"**Spot exit:** close {'below' if call else 'above'} {fmt(stop)} · **Spot target:** {fmt(tgts)}")
-        st.caption("~ = model estimate (target is the premium if spot reaches the first spot target"
-                   + ("; entry/exit too, as NSE chain is unreachable here, so confirm in your broker app" if ch is None else "")
-                   + "). Far OTM is a low-probability trade: the whole premium can go to zero.")
-        if ch is not None and rv and atm_iv > 1.5 * rv:
-            st.caption(f"⚠ IV {atm_iv:.0f}% is rich vs realised {rv:.0f}%: IV-crush risk for buyers.")
-        if dte <= 1:
-            st.caption("⚠ Expiry within a day: heavy theta decay, keep size tiny.")
-    st.caption(f"{ts or 'Price data: Yahoo'} · Rule-based, not backtested, not advice.")
+        call, kind = side == "ce", "CALL" if side == "ce" else "PUT"
+        ok, miss = sg.pick_zero(ch, spot, side, LO, HI, MIN_VOL, MIN_OI, MAX_SP)
+        if not ok.empty:  # chains without bid/ask (Groww): fetch live quotes for the top candidates, then re-pick
+            try:
+                ch = prov.enrich(info, ex, ch, side, ok.strike.head(4).tolist())
+                ok, miss = sg.pick_zero(ch, spot, side, LO, HI, MIN_VOL, MIN_OI, MAX_SP)
+            except Exception as e:
+                st.caption(f"⚠ Bid/ask quote nahi aaya ({hint(e)}), LTP use ho raha hai.")
+        if ok.empty:
+            near = [f"{int(r.strike)} @ ₹{r.px:.2f}" for x in miss for r in x.itertuples()]
+            st.warning(f"{kind} bias hai, par abhi ₹{LO:g}-{HI:g} wala liquid strike nahi."
+                       + (f" Nearest: {' / '.join(near)}." if near else "") + " Thodi der baad dobara dekho.")
+        else:
+            r, lot = ok.iloc[0], info["lot"]
+            entry, strike = float(r.px), int(r.strike)
+            st.success(f"ZERO-TO-HERO · BUY {kind} · {sym} {strike} {side.upper()} · {dfmt(ex)}")
+            st.markdown(f"**Entry** ₹{entry:.2f} ({'ask' if r[f'{side}_ask'] > 0 else 'LTP'}) · **Cost/lot** ₹{entry * lot:,.0f} · "
+                        f"**{LOTS} lots** ₹{entry * lot * LOTS:,.0f} (yehi max loss)")
+            st.markdown(f"**Target 1** ₹{entry * 3:.2f} (3x, aadha becho) · **Target 2** ₹{entry * 8:.2f} (8x, baaki) · "
+                        f"**Exit:** spot {strike:,} touch kare ya 3:15 PM, jo pehle")
+            need = abs(strike - spot)
+            tc = sg.touch_chance(spot, strike, r[f"{side}_iv"] or atm_iv, left.total_seconds() / (365 * 24 * 3600), call)
+            st.caption(f"Spot ko {need:,.0f} pts ({need / spot:.2%}) {'upar' if call else 'neeche'} jana hoga"
+                       + (f" · market-implied chance: expiry par ITM ≈ {pct(tc[0])}, beech mein touch ≈ {pct(tc[1])}" if tc else "")
+                       + f" · Bid {r[f'{side}_bid']:.2f} / Ask {r[f'{side}_ask']:.2f} · Vol {r[f'{side}_vol']:,.0f} · "
+                       f"OI {r[f'{side}_oi']:,.0f} · IV {r[f'{side}_iv']:.1f}% · Lot {lot}")
+            more = [f"{int(x.strike)} (₹{x.px:.2f})" for x in ok.iloc[1:4].itertuples()]
+            if more:
+                st.caption("Band mein aur: " + ", ".join(more))
+            if left.total_seconds() > 4 * 3600:
+                st.caption("⏳ Abhi expiry mein 4 ghante se zyada hain. Article ke hisab se last 2-3 ghante mein explosion hota hai.")
+    st.caption("Zero-to-Hero lottery hai: aksar poora premium zero hota hai. Sirf wahi paisa lagao jo doob jaye. "
+               "Rule-based, not backtested, not advice.")
 
 
 view()

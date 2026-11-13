@@ -2,4 +2,6 @@ streamlit>=1.37
 pandas
 numpy
 requests
-yfinance
+ijson
+growwapi
+pyotp

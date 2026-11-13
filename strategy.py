@@ -1,4 +1,6 @@
 """Support/resistance, trend-structure-momentum scoring, chain review, trade pick."""
+from math import erf, log, sqrt
+
 import numpy as np
 
 sgn = lambda x: int(x > 0) - int(x < 0)
@@ -70,3 +72,36 @@ def liquidity(row, p, max_spread, min_vol, min_oi):
               f"Volume >= {min_vol:,}": row[f"{p}_vol"] >= min_vol,
               f"OI >= {min_oi:,}": row[f"{p}_oi"] >= min_oi}
     return checks, sp, q
+
+
+def phi(x):
+    return 0.5 * (1 + erf(x / sqrt(2)))
+
+
+def max_pain(ch):
+    """Strike where option writers' total payout is lowest (from open interest)."""
+    k, ce, pe = ch.strike.to_numpy(float), ch.ce_oi.to_numpy(float), ch.pe_oi.to_numpy(float)
+    pain = [(ce * np.clip(x - k, 0, None)).sum() + (pe * np.clip(k - x, 0, None)).sum() for x in k]
+    return float(k[int(np.argmin(pain))])
+
+
+def pick_zero(ch, spot, side, lo, hi, min_vol, min_oi, max_spread):
+    """OTM strikes priced lo..hi (ask, or LTP when unquoted) that are liquid, most traded first, plus nearest misses."""
+    d = ch[ch.strike > spot] if side == "ce" else ch[ch.strike < spot]
+    ask, bid = d[f"{side}_ask"], d[f"{side}_bid"]
+    d = d.assign(px=ask.where(ask > 0, d[f"{side}_ltp"]))
+    mid = (ask + bid) / 2
+    wide = (ask > 0) & (bid > 0) & ((ask - bid) / mid.where(mid > 0, 1) * 100 > max_spread)
+    ok = d[d.px.between(lo, hi) & (d[f"{side}_vol"] >= min_vol) & (d[f"{side}_oi"] >= min_oi) & ~wide]
+    miss = (d[d.px > hi].nsmallest(1, "px"), d[(d.px > 0) & (d.px < lo)].nlargest(1, "px"))
+    return ok.sort_values(f"{side}_vol", ascending=False), miss
+
+
+def touch_chance(spot, strike, iv_pct, years, call):
+    """Market-implied chance spot finishes beyond the strike, and ~2x that for touching it any time before."""
+    if iv_pct <= 0 or years <= 0:
+        return None
+    s = iv_pct / 100 * sqrt(years)
+    d2 = (log(spot / strike) - s * s / 2) / s
+    p = phi(d2) if call else phi(-d2)
+    return p, min(2 * p, 1.0)
