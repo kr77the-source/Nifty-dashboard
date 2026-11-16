@@ -1,18 +1,14 @@
-# Nifty Options Dashboard (Streamlit)
+# Expiry Zero-to-Hero Dashboard (Streamlit, free live data from Upstox)
 
-Compact option-chain dashboard for Nifty, Bank Nifty, FinNifty and F&O stocks.
+Works only on an option's expiry day. Picks CALL or PUT from a score (Trend, Structure, Momentum on 5-minute candles,
+PCR, OI build-up, day move, max pain), then finds a liquid OTM strike priced Rs 3-5 and shows entry, targets and exit.
+All market data is live from the free Upstox API; nothing is estimated.
 
-- Searchable symbol dropdown (type to filter) and expiry dropdown
-- Search button, plus Auto-run toggle (refreshes every N seconds)
-- One-line market trend (Trend, Structure, Momentum, PCR) and one-line R1-R3 / S1-S3 (pivots)
-- Trade idea: BUY CALL / BUY PUT / NO TRADE with entry, exit (stop-loss), target, plus spot exit/target from pivot levels
-- Chain review (bid, ask, volume, OI, IV) and score breakdown in collapsed sections
+## Setup (no paid API)
+1. Open an Upstox account (free), then generate an Analytics Token at https://account.upstox.com/developer/apps (Analytics tab).
+2. Streamlit Cloud: Manage app -> Settings -> Secrets: `UPSTOX_TOKEN = "your-token"` (locally: environment variable).
+3. Never commit the token to GitHub.
 
-## Run
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-NSE's endpoints are unofficial and often block cloud servers, so run locally from an Indian connection if the deployed app shows no data.
+Add `?test=1` to the app URL to check live data on a non-expiry day (market hours).
 
-Heuristics only: not backtested, not investment advice.
+Rule-based, not backtested, not investment advice. Zero-to-Hero usually loses the whole premium.

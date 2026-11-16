@@ -27,24 +27,19 @@ def secret(name):
         return os.environ.get(name, "")
 
 
-if secret("UPSTOX_TOKEN"):
-    import upstox as prov
-    prov.login(secret("UPSTOX_TOKEN"))
-    SRC = "Upstox"
-elif secret("GROWW_API_KEY") and (secret("GROWW_TOTP_SECRET") or secret("GROWW_API_SECRET")):
-    import growwdata as prov
-    prov.login(secret("GROWW_API_KEY"), secret("GROWW_TOTP_SECRET"), secret("GROWW_API_SECRET"))
-    SRC = "Groww"
-else:
-    st.error("Live data ke liye broker API chahiye. Streamlit → Manage app → Settings → Secrets mein Groww ke ye do daalo:")
-    st.code('GROWW_API_KEY = "..."\nGROWW_TOTP_SECRET = "..."')
+SRC = "Upstox"
+if not secret("UPSTOX_TOKEN"):
+    st.error("Live data ke liye Upstox ka free Analytics token chahiye. Streamlit → Manage app → Settings → Secrets mein ye line daalo:")
+    st.code('UPSTOX_TOKEN = "yahan-apna-token"')
     st.stop()
+import upstox as prov
+prov.login(secret("UPSTOX_TOKEN"))
 
 
 def hint(e):
     t = str(e).lower()
     if "403" in t or "forbidden" in t:
-        return "Access nahi mila: Groww Live Data subscription active hai? (Groww app → Settings → Trading APIs)"
+        return "Access nahi mila (403): Upstox token check karo."
     if "401" in t or "unauthor" in t or "expired" in t or "invalid" in t:
         return "Credentials ya token galat/expire. Secrets check karo."
     return str(e)
@@ -128,7 +123,7 @@ def view():
     dmp = (mp - spot) / spot
     sc["MaxPain"] = (1 if dmp > 0.002 else -1 if dmp < -0.002 else 0, f"Max pain {mp:,.0f}")
     total = sum(v[0] for v in sc.values())
-    mx = 10 if ch[["ce_chg", "pe_chg"]].to_numpy().any() else 9  # OI build-up needs previous OI (Groww's chain has none)
+    mx = 10
     side = "ce" if total >= TH else "pe" if total <= -TH else None
 
     left = t1 - now
@@ -144,12 +139,6 @@ def view():
     else:
         call, kind = side == "ce", "CALL" if side == "ce" else "PUT"
         ok, miss = sg.pick_zero(ch, spot, side, LO, HI, MIN_VOL, MIN_OI, MAX_SP)
-        if not ok.empty:  # chains without bid/ask (Groww): fetch live quotes for the top candidates, then re-pick
-            try:
-                ch = prov.enrich(info, ex, ch, side, ok.strike.head(4).tolist())
-                ok, miss = sg.pick_zero(ch, spot, side, LO, HI, MIN_VOL, MIN_OI, MAX_SP)
-            except Exception as e:
-                st.caption(f"⚠ Bid/ask quote nahi aaya ({hint(e)}), LTP use ho raha hai.")
         if ok.empty:
             near = [f"{int(r.strike)} @ ₹{r.px:.2f}" for x in miss for r in x.itertuples()]
             st.warning(f"{kind} bias hai, par abhi ₹{LO:g}-{HI:g} wala liquid strike nahi."
